@@ -313,27 +313,20 @@ async function waitForDaemons(
 /**
  * Take gitfs down before the mirror sticky disk is unmounted: the daemon has
  * the mirror's packs mapped, so the disk cannot be released while it lives.
- * While the tree is still being written the workspace path is a symlink into
- * the mount; unmounting then discards the partial tree and leaves the
- * workspace empty. After the swap the path is a plain directory and the
- * daemon exits on its own once nothing holds the old mount open.
+ * `gitfs unmount` handles both phases — while the tree is still being
+ * written the workspace path is a symlink into the mount and unmounting
+ * discards the partial tree (the workspace is left empty); after the swap
+ * the path is a plain directory and the FUSE view that served it is still up
+ * on the hidden sibling path, which unmount takes down.
  */
 export async function teardown(
   mountpoint: string,
   mirrorPath: string
 ): Promise<void> {
-  let isSymlink = false
-  try {
-    isSymlink = fs.lstatSync(mountpoint).isSymbolicLink()
-  } catch {
-    // mountpoint gone
-  }
-  if (isSymlink) {
-    const binary = await findBinary()
-    if (binary) {
-      core.info(`[gitfs] Unmounting ${mountpoint}`)
-      await exec.exec(binary, ['unmount', mountpoint], {ignoreReturnCode: true})
-    }
+  const binary = await findBinary()
+  if (binary && fs.existsSync(mountpoint)) {
+    core.info(`[gitfs] Unmounting ${mountpoint}`)
+    await exec.exec(binary, ['unmount', mountpoint], {ignoreReturnCode: true})
   }
   let pids = await waitForDaemons(mirrorPath, DAEMON_EXIT_TIMEOUT_MS)
   if (pids.length > 0) {

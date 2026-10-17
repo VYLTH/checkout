@@ -330,8 +330,10 @@ checking it out:
    produced) plus `git read-tree <sha>` for the index. Git is usable from the
    first step; the first `git status` verifies file contents instead of
    trusting stat data.
-4. The post step takes gitfs down before the mirror sticky disk is unmounted.
-   If the job ends before the swap, the partial tree is discarded.
+4. The post step takes gitfs down before the mirror sticky disk is unmounted
+   (after the swap the FUSE view stays mounted on a hidden sibling path so
+   processes that were inside it keep a working cwd; `gitfs unmount` removes
+   it). If the job ends before the swap, the partial tree is discarded.
 
 gitfs is only used for the plain case — Linux runner VM (not inside a
 container), the mirror mounted, and no submodules, LFS, sparse checkout,
