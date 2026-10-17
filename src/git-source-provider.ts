@@ -11,6 +11,7 @@ import * as stateHelper from './state-helper'
 import * as urlHelper from './url-helper'
 import * as blacksmithCache from './blacksmith-cache'
 import * as mirrorTelemetry from './mirror-telemetry'
+import * as gitfs from './gitfs'
 import {
   FetchOptions,
   MinimumGitAlternateRefsCommandVersion,
@@ -295,6 +296,25 @@ async function getSourceInner(
       }
     }
 
+    // Serve the workspace with gitfs when the job asks for it: mount the
+    // requested revision from the mirror now (milliseconds), and let the
+    // tree be written out behind the job. The .git set up below is created
+    // through the mount, so git works from the first step. Anything gitfs
+    // cannot serve falls through to the regular fetch + checkout.
+    let gitfsRevision: gitfs.MirrorRevision | null = null
+    if (gitfs.isGitfsRequested()) {
+      core.startGroup('Mounting the repository with gitfs')
+      try {
+        gitfsRevision = await mountWithGitfs(settings, cacheInfo, repositoryUrl)
+      } catch (error) {
+        core.warning(
+          `[gitfs] mount failed, using the regular checkout: ${error}`
+        )
+        gitfsRevision = null
+      }
+      core.endGroup()
+    }
+
     // Initialize the repository
     if (
       !fsHelper.directoryExistsSync(path.join(settings.repositoryPath, '.git'))
@@ -355,194 +375,31 @@ async function getSourceInner(
       await git.lfsInstall()
     }
 
-    // Fetch
-    core.startGroup('Fetching the repository')
-    const objectsDir = path.join(settings.repositoryPath, '.git', 'objects')
-    const objectsBytesBefore = cacheInfo
-      ? await mirrorTelemetry.dirSizeBytesOrNull(objectsDir)
-      : null
-    const fetchStart = Date.now()
-    const fetchOptions: FetchOptions = {}
-
-    if (settings.filter) {
-      fetchOptions.filter = settings.filter
-    } else if (settings.sparseCheckout) {
-      fetchOptions.filter = 'blob:none'
-    }
-
-    if (settings.fetchDepth <= 0) {
-      // When the Blacksmith mirror is available and synced with the remote,
-      // copy branch/tag refs from it locally (objects are already shared via
-      // alternates) instead of doing a full +refs/heads/* fetch over the
-      // network, and only ask the network for the specific ref/commit this
-      // run needs.
-      let fetchedFromMirror = false
-      if (
-        cacheInfo &&
-        mirrorFresh &&
-        !fetchOptions.filter &&
-        !fsHelper.fileExistsSync(
-          path.join(settings.repositoryPath, '.git', 'shallow')
-        )
-      ) {
-        fetchedFromMirror = await blacksmithCache.fetchRefsFromMirror(
-          settings.repositoryPath,
-          cacheInfo.mirrorPath,
-          git.getEnvironment()
-        )
-      }
-
-      if (fetchedFromMirror) {
-        // The mirror copy only materializes branches and tags. Any other ref
-        // (refs/pull/*, etc.) must be fetched from the network so its local
-        // destination ref exists for checkout. For branches/tags, verify the
-        // wanted ref/commit is present and fetch it directly if not.
-        const upperRef = (settings.ref || '').toUpperCase()
-        const coveredByMirror =
-          !settings.ref ||
-          !upperRef.startsWith('REFS/') ||
-          upperRef.startsWith('REFS/HEADS/') ||
-          upperRef.startsWith('REFS/TAGS/')
-        let verified = false
-        if (coveredByMirror) {
-          verified = await refHelper.testRef(git, settings.ref, settings.commit)
-          if (verified && settings.commit) {
-            verified = await git.shaExists(settings.commit)
-          }
-        }
-        if (!verified) {
-          const refSpec = refHelper.getRefSpec(settings.ref, settings.commit)
-          await git.fetch(refSpec, fetchOptions)
-        }
-      } else {
-        // Fetch all branches and tags
-        let refSpec = refHelper.getRefSpecForAllHistory(
-          settings.ref,
-          settings.commit
-        )
-        await git.fetch(refSpec, fetchOptions)
-
-        // When all history is fetched, the ref we're interested in may have moved to a different
-        // commit (push or force push). If so, fetch again with a targeted refspec.
-        if (!(await refHelper.testRef(git, settings.ref, settings.commit))) {
-          refSpec = refHelper.getRefSpec(settings.ref, settings.commit)
-          await git.fetch(refSpec, fetchOptions)
-        }
-      }
-    } else {
-      fetchOptions.fetchDepth = settings.fetchDepth
-      fetchOptions.fetchTags = settings.fetchTags
-      // With the mirror attached as an alternate, git would treat every
-      // mirror ref as a known tip: the deepening fetch's connectivity check
-      // walks the whole mirror object graph and negotiation offers every
-      // mirror ref. Turn alternate ref discovery off and offer a few mirror
-      // tips explicitly instead, so the server still sends only the delta
-      // from the mirror (see resolveShallowNegotiationTips).
-      if (
-        cacheInfo &&
-        (await git.version()).checkMinimum(
-          MinimumGitAlternateRefsCommandVersion
-        ) &&
-        (await blacksmithCache.sharesMirrorObjects(
-          settings.repositoryPath,
-          cacheInfo.mirrorPath
-        ))
-      ) {
-        fetchOptions.ignoreAlternateRefs = true
-        fetchOptions.negotiationTips =
-          await blacksmithCache.resolveShallowNegotiationTips(
-            cacheInfo.mirrorPath,
-            settings.ref,
-            process.env['GITHUB_BASE_REF'] || ''
-          )
-        core.info(
-          `[git-mirror] Shallow fetch negotiating from ${fetchOptions.negotiationTips.length} mirror tip(s) with alternate ref discovery disabled`
-        )
-      }
-      const refSpec = refHelper.getRefSpec(settings.ref, settings.commit)
-      await git.fetch(refSpec, fetchOptions)
-    }
-    if (cacheInfo) {
-      // Mirror-served: the fetch pulls only the delta the mirror is missing.
-      report.delta_fetch_ms = Date.now() - fetchStart
-      const objectsBytesAfter =
-        await mirrorTelemetry.dirSizeBytesOrNull(objectsDir)
-      report.delta_fetch_bytes =
-        objectsBytesBefore !== null && objectsBytesAfter !== null
-          ? Math.max(0, objectsBytesAfter - objectsBytesBefore)
-          : 0
+    if (gitfsRevision && cacheInfo) {
+      // The tree is already served from the mirror: give the workspace the
+      // refs and index the regular path would have produced and skip the
+      // fetch + checkout.
+      core.startGroup('Pointing the repository at the mounted revision')
+      const pointStart = Date.now()
+      await blacksmithCache.fetchRefsFromMirror(
+        settings.repositoryPath,
+        cacheInfo.mirrorPath,
+        git.getEnvironment()
+      )
+      await gitfs.pointWorkspaceAt(
+        settings.repositoryPath,
+        settings.ref,
+        gitfsRevision,
+        git.getEnvironment()
+      )
+      report.clone_from_mirror_ms += Date.now() - pointStart
       report.mirror_size_bytes = await mirrorTelemetry.packSizeBytes(
         cacheInfo.mirrorPath
       )
       report.ref_count = await mirrorTelemetry.refCount(cacheInfo.mirrorPath)
-    } else {
-      // Fallback/bypass: the fetch is the full checkout cost.
-      report.full_checkout_ms = Date.now() - fetchStart
-    }
-    core.endGroup()
-
-    // Checkout info
-    core.startGroup('Determining the checkout info')
-    const checkoutInfo = await refHelper.getCheckoutInfo(
-      git,
-      settings.ref,
-      settings.commit
-    )
-    core.endGroup()
-
-    // LFS fetch
-    // Explicit lfs-fetch to avoid slow checkout (fetches one lfs object at a time).
-    // Explicit lfs fetch will fetch lfs objects in parallel.
-    // For sparse checkouts, let `checkout` fetch the needed objects lazily.
-    if (settings.lfs && !settings.sparseCheckout) {
-      core.startGroup('Fetching LFS objects')
-      const lfsStart = Date.now()
-      await git.lfsFetch(checkoutInfo.startPoint || checkoutInfo.ref)
-      report.lfs_ms = Date.now() - lfsStart
       core.endGroup()
-    }
-
-    // Sparse checkout
-    if (!settings.sparseCheckout) {
-      let gitVersion = await git.version()
-      // no need to disable sparse-checkout if the installed git runtime doesn't even support it.
-      if (gitVersion.checkMinimum(MinimumGitSparseCheckoutVersion)) {
-        await git.disableSparseCheckout()
-      }
     } else {
-      core.startGroup('Setting up sparse checkout')
-      if (settings.sparseCheckoutConeMode) {
-        await git.sparseCheckout(settings.sparseCheckout)
-      } else {
-        await git.sparseCheckoutNonConeMode(settings.sparseCheckout)
-      }
-      core.endGroup()
-    }
-
-    // Checkout
-    core.startGroup('Checking out the ref')
-    const checkoutStart = Date.now()
-    await git.checkout(checkoutInfo.ref, checkoutInfo.startPoint)
-    if (cacheInfo) {
-      // Materializing the working tree reads objects from the mirror through
-      // alternates — the second half of the clone-from-mirror cost.
-      report.clone_from_mirror_ms += Date.now() - checkoutStart
-    } else {
-      // Fallback/bypass: working-tree materialization is part of the full
-      // checkout cost, keeping phase totals comparable across serving modes.
-      report.full_checkout_ms += Date.now() - checkoutStart
-    }
-    core.endGroup()
-
-    // Dissociate from Blacksmith mirror if requested
-    // This copies all objects from alternates into the local repo so it's independent
-    if (settings.dissociate && cacheInfo) {
-      core.startGroup('Dissociating from Blacksmith mirror')
-      await blacksmithCache.dissociate(
-        settings.repositoryPath,
-        git.getEnvironment()
-      )
-      core.endGroup()
+      await fetchAndCheckout(settings, git, cacheInfo, mirrorFresh, report)
     }
 
     // Submodules
@@ -599,6 +456,275 @@ async function getSourceInner(
       }
       authHelper.removeGlobalConfig()
     }
+  }
+}
+
+/**
+ * Mount the requested revision from the mirror with gitfs. Returns null,
+ * after logging why, when this checkout is outside the gitfs cohort; throws
+ * when gitfs was attempted and failed.
+ */
+async function mountWithGitfs(
+  settings: IGitSourceSettings,
+  cacheInfo: blacksmithCache.CacheInfo | null,
+  repositoryUrl: string
+): Promise<gitfs.MirrorRevision | null> {
+  const reason = gitfs.gitfsIneligibilityReason(settings, {
+    mirrorPath: cacheInfo?.mirrorPath ?? null
+  })
+  if (reason || !cacheInfo) {
+    core.info(`[gitfs] not used: ${reason}`)
+    return null
+  }
+  const binary = await gitfs.findBinary()
+  if (!binary) {
+    core.info('[gitfs] not used: gitfs binary not found on PATH')
+    return null
+  }
+
+  const candidates = gitfs.mirrorRevisionCandidates(
+    settings.ref,
+    settings.commit
+  )
+  let revision = await gitfs.resolveInMirror(cacheInfo.mirrorPath, candidates)
+  if (!revision) {
+    // The mirror does not have the requested revision yet (a push it has
+    // not synced, a pull-request merge ref): fetch just that into the
+    // mirror, where the regular path would have fetched it into the
+    // workspace. The mirror changed, so the post step commits it.
+    const refspecs = gitfs.mirrorFetchRefspecs(settings.ref, settings.commit)
+    core.info(
+      `[gitfs] ${settings.commit || settings.ref} is not in the mirror, fetching ${refspecs.join(' ')}`
+    )
+    await gitfs.fetchIntoMirror(
+      cacheInfo.mirrorPath,
+      repositoryUrl,
+      settings.authToken,
+      refspecs
+    )
+    stateHelper.setBlacksmithCacheMirrorChanged(true)
+    revision = await gitfs.resolveInMirror(cacheInfo.mirrorPath, candidates)
+  }
+  if (!revision) {
+    core.info(
+      `[gitfs] not used: ${settings.commit || settings.ref} could not be resolved in the mirror`
+    )
+    return null
+  }
+
+  const mountStart = Date.now()
+  await gitfs.mount(
+    binary,
+    cacheInfo.mirrorPath,
+    revision.sha,
+    settings.repositoryPath
+  )
+  stateHelper.setGitfsMountPoint(settings.repositoryPath)
+  core.info(
+    `[gitfs] ${settings.repositoryPath} serves ${revision.sha} from the mirror (mounted in ${Date.now() - mountStart} ms); the tree is written out in the background`
+  )
+  return revision
+}
+
+/**
+ * The regular path: fetch the requested revision into the workspace (from
+ * the mirror where possible) and check it out.
+ */
+async function fetchAndCheckout(
+  settings: IGitSourceSettings,
+  git: IGitCommandManager,
+  cacheInfo: blacksmithCache.CacheInfo | null,
+  mirrorFresh: boolean,
+  report: mirrorTelemetry.CheckoutReport
+): Promise<void> {
+  // Fetch
+  core.startGroup('Fetching the repository')
+  const objectsDir = path.join(settings.repositoryPath, '.git', 'objects')
+  const objectsBytesBefore = cacheInfo
+    ? await mirrorTelemetry.dirSizeBytesOrNull(objectsDir)
+    : null
+  const fetchStart = Date.now()
+  const fetchOptions: FetchOptions = {}
+
+  if (settings.filter) {
+    fetchOptions.filter = settings.filter
+  } else if (settings.sparseCheckout) {
+    fetchOptions.filter = 'blob:none'
+  }
+
+  if (settings.fetchDepth <= 0) {
+    // When the Blacksmith mirror is available and synced with the remote,
+    // copy branch/tag refs from it locally (objects are already shared via
+    // alternates) instead of doing a full +refs/heads/* fetch over the
+    // network, and only ask the network for the specific ref/commit this
+    // run needs.
+    let fetchedFromMirror = false
+    if (
+      cacheInfo &&
+      mirrorFresh &&
+      !fetchOptions.filter &&
+      !fsHelper.fileExistsSync(
+        path.join(settings.repositoryPath, '.git', 'shallow')
+      )
+    ) {
+      fetchedFromMirror = await blacksmithCache.fetchRefsFromMirror(
+        settings.repositoryPath,
+        cacheInfo.mirrorPath,
+        git.getEnvironment()
+      )
+    }
+
+    if (fetchedFromMirror) {
+      // The mirror copy only materializes branches and tags. Any other ref
+      // (refs/pull/*, etc.) must be fetched from the network so its local
+      // destination ref exists for checkout. For branches/tags, verify the
+      // wanted ref/commit is present and fetch it directly if not.
+      const upperRef = (settings.ref || '').toUpperCase()
+      const coveredByMirror =
+        !settings.ref ||
+        !upperRef.startsWith('REFS/') ||
+        upperRef.startsWith('REFS/HEADS/') ||
+        upperRef.startsWith('REFS/TAGS/')
+      let verified = false
+      if (coveredByMirror) {
+        verified = await refHelper.testRef(git, settings.ref, settings.commit)
+        if (verified && settings.commit) {
+          verified = await git.shaExists(settings.commit)
+        }
+      }
+      if (!verified) {
+        const refSpec = refHelper.getRefSpec(settings.ref, settings.commit)
+        await git.fetch(refSpec, fetchOptions)
+      }
+    } else {
+      // Fetch all branches and tags
+      let refSpec = refHelper.getRefSpecForAllHistory(
+        settings.ref,
+        settings.commit
+      )
+      await git.fetch(refSpec, fetchOptions)
+
+      // When all history is fetched, the ref we're interested in may have moved to a different
+      // commit (push or force push). If so, fetch again with a targeted refspec.
+      if (!(await refHelper.testRef(git, settings.ref, settings.commit))) {
+        refSpec = refHelper.getRefSpec(settings.ref, settings.commit)
+        await git.fetch(refSpec, fetchOptions)
+      }
+    }
+  } else {
+    fetchOptions.fetchDepth = settings.fetchDepth
+    fetchOptions.fetchTags = settings.fetchTags
+    // With the mirror attached as an alternate, git would treat every
+    // mirror ref as a known tip: the deepening fetch's connectivity check
+    // walks the whole mirror object graph and negotiation offers every
+    // mirror ref. Turn alternate ref discovery off and offer a few mirror
+    // tips explicitly instead, so the server still sends only the delta
+    // from the mirror (see resolveShallowNegotiationTips).
+    if (
+      cacheInfo &&
+      (await git.version()).checkMinimum(
+        MinimumGitAlternateRefsCommandVersion
+      ) &&
+      (await blacksmithCache.sharesMirrorObjects(
+        settings.repositoryPath,
+        cacheInfo.mirrorPath
+      ))
+    ) {
+      fetchOptions.ignoreAlternateRefs = true
+      fetchOptions.negotiationTips =
+        await blacksmithCache.resolveShallowNegotiationTips(
+          cacheInfo.mirrorPath,
+          settings.ref,
+          process.env['GITHUB_BASE_REF'] || ''
+        )
+      core.info(
+        `[git-mirror] Shallow fetch negotiating from ${fetchOptions.negotiationTips.length} mirror tip(s) with alternate ref discovery disabled`
+      )
+    }
+    const refSpec = refHelper.getRefSpec(settings.ref, settings.commit)
+    await git.fetch(refSpec, fetchOptions)
+  }
+  if (cacheInfo) {
+    // Mirror-served: the fetch pulls only the delta the mirror is missing.
+    report.delta_fetch_ms = Date.now() - fetchStart
+    const objectsBytesAfter =
+      await mirrorTelemetry.dirSizeBytesOrNull(objectsDir)
+    report.delta_fetch_bytes =
+      objectsBytesBefore !== null && objectsBytesAfter !== null
+        ? Math.max(0, objectsBytesAfter - objectsBytesBefore)
+        : 0
+    report.mirror_size_bytes = await mirrorTelemetry.packSizeBytes(
+      cacheInfo.mirrorPath
+    )
+    report.ref_count = await mirrorTelemetry.refCount(cacheInfo.mirrorPath)
+  } else {
+    // Fallback/bypass: the fetch is the full checkout cost.
+    report.full_checkout_ms = Date.now() - fetchStart
+  }
+  core.endGroup()
+
+  // Checkout info
+  core.startGroup('Determining the checkout info')
+  const checkoutInfo = await refHelper.getCheckoutInfo(
+    git,
+    settings.ref,
+    settings.commit
+  )
+  core.endGroup()
+
+  // LFS fetch
+  // Explicit lfs-fetch to avoid slow checkout (fetches one lfs object at a time).
+  // Explicit lfs fetch will fetch lfs objects in parallel.
+  // For sparse checkouts, let `checkout` fetch the needed objects lazily.
+  if (settings.lfs && !settings.sparseCheckout) {
+    core.startGroup('Fetching LFS objects')
+    const lfsStart = Date.now()
+    await git.lfsFetch(checkoutInfo.startPoint || checkoutInfo.ref)
+    report.lfs_ms = Date.now() - lfsStart
+    core.endGroup()
+  }
+
+  // Sparse checkout
+  if (!settings.sparseCheckout) {
+    let gitVersion = await git.version()
+    // no need to disable sparse-checkout if the installed git runtime doesn't even support it.
+    if (gitVersion.checkMinimum(MinimumGitSparseCheckoutVersion)) {
+      await git.disableSparseCheckout()
+    }
+  } else {
+    core.startGroup('Setting up sparse checkout')
+    if (settings.sparseCheckoutConeMode) {
+      await git.sparseCheckout(settings.sparseCheckout)
+    } else {
+      await git.sparseCheckoutNonConeMode(settings.sparseCheckout)
+    }
+    core.endGroup()
+  }
+
+  // Checkout
+  core.startGroup('Checking out the ref')
+  const checkoutStart = Date.now()
+  await git.checkout(checkoutInfo.ref, checkoutInfo.startPoint)
+  if (cacheInfo) {
+    // Materializing the working tree reads objects from the mirror through
+    // alternates — the second half of the clone-from-mirror cost.
+    report.clone_from_mirror_ms += Date.now() - checkoutStart
+  } else {
+    // Fallback/bypass: working-tree materialization is part of the full
+    // checkout cost, keeping phase totals comparable across serving modes.
+    report.full_checkout_ms += Date.now() - checkoutStart
+  }
+  core.endGroup()
+
+  // Dissociate from Blacksmith mirror if requested
+  // This copies all objects from alternates into the local repo so it's independent
+  if (settings.dissociate && cacheInfo) {
+    core.startGroup('Dissociating from Blacksmith mirror')
+    await blacksmithCache.dissociate(
+      settings.repositoryPath,
+      git.getEnvironment()
+    )
+    core.endGroup()
   }
 }
 

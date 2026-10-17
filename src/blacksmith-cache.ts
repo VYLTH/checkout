@@ -431,7 +431,7 @@ export async function setupCache(
  * 1. The header value is not visible in process arguments
  * 2. It follows the same pattern used by the upstream checkout action
  */
-function getAuthConfigArgs(
+export function getAuthConfigArgs(
   repoUrl: string,
   authToken: string
 ): {configKey: string; configValue: string} {
