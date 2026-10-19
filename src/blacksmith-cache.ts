@@ -2369,7 +2369,7 @@ export function decodeVarint(data: Uint8Array): number | null {
  */
 export function fstrimTimeoutSecsFrom(
   response: object,
-  unknownFields: ReadonlyArray<UnknownProtoField>
+  unknownFields: readonly UnknownProtoField[]
 ): number {
   const typed = (response as {fstrimTimeoutSecs?: unknown}).fstrimTimeoutSecs
   if (typed !== undefined) return parseFstrimTimeoutSecs(typed)
