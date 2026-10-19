@@ -153,23 +153,17 @@ export function mirrorRevisionCandidates(
 }
 
 /**
- * Refspecs that bring the requested ref/commit into the mirror when it is
- * not there yet (a push the mirror has not synced, or a pull-request merge
- * ref). Qualified refs are fetched under their own name so the workspace
- * can mirror them; a bare commit is fetched by sha.
+ * What `gitfs mount --url` fetches for a revision the mirror lacks: a commit
+ * by sha, a qualified ref by name, an unqualified ref as a branch.
  */
-export function mirrorFetchRefspecs(ref: string, commit: string): string[] {
-  const qualified = !!ref && ref.toUpperCase().startsWith('REFS/')
+export function coldRevision(ref: string, commit: string): string {
   if (commit) {
-    return qualified ? [`+${commit}:${ref}`] : [commit]
+    return commit
   }
-  if (qualified) {
-    return [`+${ref}:${ref}`]
+  if (ref.toUpperCase().startsWith('REFS/')) {
+    return ref
   }
-  return [
-    `+refs/heads/${ref}*:refs/heads/${ref}*`,
-    `+refs/tags/${ref}*:refs/tags/${ref}*`
-  ]
+  return `refs/heads/${ref}`
 }
 
 export async function resolveInMirror(
@@ -230,6 +224,53 @@ export async function mount(
     mountpoint,
     '--daemon'
   ])
+}
+
+/**
+ * Mount a revision the mirror does not have: gitfs fetches it from the
+ * remote into the mirror (`--depth 1`, serving the pack as it arrives) and
+ * completes the mirror in the background. Returns the commit sha, which
+ * gitfs prints once the commit is in, before git has written the ref.
+ */
+export async function mountCold(
+  binary: string,
+  mirrorPath: string,
+  rev: string,
+  mountpoint: string,
+  repositoryUrl: string,
+  authToken: string
+): Promise<string> {
+  if (fs.existsSync(mountpoint) && fs.readdirSync(mountpoint).length > 0) {
+    throw new Error(`${mountpoint} is not empty`)
+  }
+  const env: {[key: string]: string} = {}
+  for (const [key, value] of Object.entries(process.env)) {
+    if (value !== undefined) {
+      env[key] = value
+    }
+  }
+  env.GITFS_TOKEN = authToken
+  const result = await exec.getExecOutput(
+    binary,
+    [
+      'mount',
+      mirrorPath,
+      '--ref',
+      rev,
+      mountpoint,
+      '--daemon',
+      '--url',
+      repositoryUrl
+    ],
+    {env}
+  )
+  const sha = result.stdout.trim().split('\n').pop()?.trim() ?? ''
+  if (!/^[0-9a-f]{40}$/.test(sha)) {
+    throw new Error(
+      `gitfs did not report the mounted commit: ${result.stdout.trim()}`
+    )
+  }
+  return sha
 }
 
 /**

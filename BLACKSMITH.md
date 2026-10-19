@@ -335,6 +335,18 @@ checking it out:
    processes that were inside it keep a working cwd; `gitfs unmount` removes
    it). If the job ends before the swap, the partial tree is discarded.
 
+When the mirror lacks the revision — an empty sticky disk on the repository's
+first job, a push the mirror has not synced, a pull-request merge ref — the
+action does not hydrate with a blocking `git clone --mirror`. It creates an
+empty bare mirror (first job) and runs `gitfs mount <mirror> --ref <rev>
+--url <repo>`: gitfs fetches the revision with `--depth 1` *into the mirror*
+and serves the pack as it arrives, so the step returns as soon as the commit
+is in (about a second for a 28 000-file repository from GitHub); when that
+pack is complete gitfs fetches the rest of the repository in the background,
+and the sticky disk is committed with a complete, ordinary mirror. The post
+step's `gitfs unmount` ends a fetch still in flight; a mirror left shallow
+that way is completed by the next job's mount.
+
 gitfs is only used for the plain case — Linux runner VM (not inside a
 container), the mirror mounted, and no submodules, LFS, sparse checkout,
 `filter` or `dissociate` — and only when the `gitfs` binary is on the PATH.

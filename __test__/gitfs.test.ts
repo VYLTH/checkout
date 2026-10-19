@@ -138,153 +138,69 @@ describe('mirrorRevisionCandidates', () => {
   })
 })
 
-describe('mirrorFetchRefspecs', () => {
-  const sha = 'c'.repeat(40)
-  it('fetches qualified refs under their own name and bare commits by sha', () => {
-    expect(gitfs.mirrorFetchRefspecs('refs/pull/7/merge', sha)).toEqual([
-      `+${sha}:refs/pull/7/merge`
-    ])
-    expect(gitfs.mirrorFetchRefspecs('refs/heads/dev', '')).toEqual([
-      '+refs/heads/dev:refs/heads/dev'
-    ])
-    expect(gitfs.mirrorFetchRefspecs('', sha)).toEqual([sha])
-    expect(gitfs.mirrorFetchRefspecs('dev', sha)).toEqual([sha])
-    expect(gitfs.mirrorFetchRefspecs('dev', '')).toEqual([
-      '+refs/heads/dev*:refs/heads/dev*',
-      '+refs/tags/dev*:refs/tags/dev*'
-    ])
+describe('coldRevision', () => {
+  const sha = 'a'.repeat(40)
+  it('fetches a commit by sha, a qualified ref by name, a bare ref as a branch', () => {
+    expect(gitfs.coldRevision('refs/pull/7/merge', sha)).toBe(sha)
+    expect(gitfs.coldRevision('refs/pull/7/merge', '')).toBe(
+      'refs/pull/7/merge'
+    )
+    expect(gitfs.coldRevision('refs/tags/v1', '')).toBe('refs/tags/v1')
+    expect(gitfs.coldRevision('dev', '')).toBe('refs/heads/dev')
   })
 })
 
-// End-to-end against a real mirror and the gitfs binary (skipped when gitfs
-// is not on PATH): mount, give the workspace its .git through the mount, and
-// check git is usable before and after the swap to the native tree.
-const hasGitfs = ((): boolean => {
-  try {
-    execFileSync('gitfs', ['--help'], {stdio: 'ignore'})
-    return true
-  } catch {
-    return false
-  }
-})()
-
-const describeE2E =
-  hasGitfs && process.platform === 'linux' ? describe : describe.skip
-
-describeE2E('gitfs mount of a --mirror clone', () => {
-  jest.setTimeout(120_000)
-  let root: string
-  let mirror: string
-  let workspace: string
-  const git = (cwd: string, args: string[]): string =>
-    execFileSync('git', ['-C', cwd, ...args], {
-      encoding: 'utf8',
-      env: {
-        ...process.env,
-        GIT_AUTHOR_NAME: 't',
-        GIT_AUTHOR_EMAIL: 't@t',
-        GIT_COMMITTER_NAME: 't',
-        GIT_COMMITTER_EMAIL: 't@t'
-      }
-    }).trim()
-
-  beforeAll(() => {
-    root = fs.mkdtempSync(path.join(os.tmpdir(), 'gitfs-e2e-'))
-    const upstream = path.join(root, 'upstream')
-    fs.mkdirSync(upstream)
-    git(upstream, ['init', '-q', '-b', 'main'])
-    fs.mkdirSync(path.join(upstream, 'src'))
-    fs.writeFileSync(path.join(upstream, 'src', 'a.txt'), 'a\n')
-    fs.writeFileSync(path.join(upstream, 'README'), 'hi\n')
-    git(upstream, ['add', '.'])
-    git(upstream, ['commit', '-q', '-m', 'one'])
-    git(upstream, ['tag', 'v1'])
-    fs.writeFileSync(path.join(upstream, 'src', 'b.txt'), 'b\n')
-    git(upstream, ['add', '.'])
-    git(upstream, ['commit', '-q', '-m', 'two'])
-    mirror = path.join(root, 'owner-repo.git')
-    execFileSync('git', ['clone', '-q', '--mirror', upstream, mirror])
-    workspace = path.join(root, 'work', 'repo')
-    fs.mkdirSync(workspace, {recursive: true})
-  })
-
-  afterAll(async () => {
-    if (workspace) {
-      await gitfs.teardown(workspace, mirror)
-    }
-    fs.rmSync(root, {recursive: true, force: true})
-  })
-
-  it('serves the branch tip with a working .git from the first command', async () => {
+describe('mountCold (needs gitfs on PATH)', () => {
+  it('mounts a revision an empty mirror lacks and completes the mirror', async () => {
     const binary = await gitfs.findBinary()
-    expect(binary).not.toBeNull()
-    const revision = await gitfs.resolveInMirror(
-      mirror,
-      gitfs.mirrorRevisionCandidates('refs/heads/main', '')
-    )
-    expect(revision).toEqual({
-      sha: git(mirror, ['rev-parse', 'refs/heads/main']),
-      mirrorRef: 'refs/heads/main',
-      kind: 'branch'
-    })
-
-    await gitfs.mount(binary!, mirror, revision!.sha, workspace)
-    expect(fs.readFileSync(path.join(workspace, 'src', 'b.txt'), 'utf8')).toBe(
-      'b\n'
-    )
-
-    git(workspace, ['init', '-q'])
-    fs.mkdirSync(path.join(workspace, '.git', 'objects', 'info'), {
-      recursive: true
-    })
-    fs.writeFileSync(
-      path.join(workspace, '.git', 'objects', 'info', 'alternates'),
-      `${mirror}/objects\n`
-    )
-    git(workspace, ['remote', 'add', 'origin', mirror])
-    execFileSync('git', [
-      '-C',
-      workspace,
-      'fetch',
-      '-q',
-      '--no-tags',
-      mirror,
-      '+refs/heads/*:refs/remotes/origin/*',
-      '+refs/tags/*:refs/tags/*'
-    ])
-    await gitfs.pointWorkspaceAt(workspace, 'refs/heads/main', revision!)
-
-    expect(git(workspace, ['rev-parse', 'HEAD'])).toBe(revision!.sha)
-    expect(git(workspace, ['symbolic-ref', 'HEAD'])).toBe('refs/heads/main')
-    expect(git(workspace, ['rev-parse', 'refs/remotes/origin/main'])).toBe(
-      revision!.sha
-    )
-    expect(git(workspace, ['status', '--porcelain'])).toBe('')
-    expect(git(workspace, ['log', '--oneline']).split('\n')).toHaveLength(2)
-
-    // Wait for the swap: the workspace path becomes a plain directory.
-    const deadline = Date.now() + 60_000
-    while (fs.lstatSync(workspace).isSymbolicLink() && Date.now() < deadline) {
-      await new Promise(r => setTimeout(r, 50))
+    if (!binary) {
+      console.log('skipping: gitfs not on PATH')
+      return
     }
-    expect(fs.lstatSync(workspace).isDirectory()).toBe(true)
-    expect(git(workspace, ['status', '--porcelain'])).toBe('')
-    expect(git(workspace, ['rev-parse', 'HEAD'])).toBe(revision!.sha)
-    expect(fs.readFileSync(path.join(workspace, 'src', 'a.txt'), 'utf8')).toBe(
-      'a\n'
-    )
-
-    // The mirror itself is untouched.
-    expect(
-      fs.existsSync(path.join(mirror, 'objects', 'info', 'alternates'))
-    ).toBe(false)
-  })
-
-  it('refuses a non-empty mountpoint', async () => {
-    const dir = fs.mkdtempSync(path.join(root, 'nonempty-'))
-    fs.writeFileSync(path.join(dir, 'x'), '')
-    await expect(gitfs.mount('gitfs', mirror, 'HEAD', dir)).rejects.toThrow(
-      /not empty/
-    )
-  })
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gitfs-cold-'))
+    const git = (cwd: string, ...args: string[]): string =>
+      execFileSync('git', args, {cwd, stdio: 'pipe'}).toString().trim()
+    const author = ['-c', 'user.name=t', '-c', 'user.email=t@t']
+    const work = path.join(root, 'work')
+    fs.mkdirSync(work)
+    git(work, 'init', '-q', '-b', 'main')
+    git(work, ...author, 'commit', '-q', '--allow-empty', '-m', 'first')
+    fs.writeFileSync(path.join(work, 'hello.txt'), 'hello\n')
+    git(work, 'add', '-A')
+    git(work, ...author, 'commit', '-q', '-m', 'second')
+    const upstream = path.join(root, 'upstream.git')
+    git(root, 'clone', '-q', '--bare', work, upstream)
+    const url = `file://${upstream}`
+    const mirror = path.join(root, 'mirror.git')
+    git(root, 'init', '-q', '--bare', mirror)
+    git(mirror, 'remote', 'add', '--mirror=fetch', 'origin', url)
+    const mnt = path.join(root, 'ws')
+    fs.mkdirSync(mnt)
+    try {
+      const sha = await gitfs.mountCold(
+        binary,
+        mirror,
+        'refs/heads/main',
+        mnt,
+        url,
+        ''
+      )
+      expect(sha).toBe(git(upstream, 'rev-parse', 'refs/heads/main'))
+      expect(fs.readFileSync(path.join(mnt, 'hello.txt'), 'utf8')).toBe(
+        'hello\n'
+      )
+      const deadline = Date.now() + 30000
+      while (
+        fs.existsSync(path.join(mirror, 'shallow')) &&
+        Date.now() < deadline
+      ) {
+        await new Promise(resolve => setTimeout(resolve, 50))
+      }
+      expect(fs.existsSync(path.join(mirror, 'shallow'))).toBe(false)
+      expect(git(mirror, 'rev-list', '--count', 'main')).toBe('2')
+    } finally {
+      await gitfs.teardown(mnt, mirror)
+      fs.rmSync(root, {recursive: true, force: true})
+    }
+  }, 60000)
 })

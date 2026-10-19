@@ -50,6 +50,7 @@ exports.getMirrorPath = getMirrorPath;
 exports.stickyDiskKeyFor = stickyDiskKeyFor;
 exports.setupCache = setupCache;
 exports.getAuthConfigArgs = getAuthConfigArgs;
+exports.initEmptyMirror = initEmptyMirror;
 exports.ensureMirror = ensureMirror;
 exports.diffMirrorRefs = diffMirrorRefs;
 exports.purgePullRefs = purgePullRefs;
@@ -500,6 +501,34 @@ function summarizeTrace2Perf(trace2PerfPath, title) {
     finally {
         fs.rmSync(trace2PerfPath, { force: true });
     }
+}
+/**
+ * An empty bare mirror with `git clone --mirror`'s config, for gitfs to
+ * stream the first job's revision into; gitfs completes the mirror in the
+ * background, so it is a full mirror by the time the job ends.
+ */
+function initEmptyMirror(mirrorPath, repoUrl) {
+    return __awaiter(this, void 0, void 0, function* () {
+        var _a, _b, _c, _d;
+        const mirrorDir = path.dirname(mirrorPath);
+        yield exec.exec('sudo', ['mkdir', '-p', mirrorDir]);
+        const uid = (_b = (_a = process.getuid) === null || _a === void 0 ? void 0 : _a.call(process)) !== null && _b !== void 0 ? _b : 1000;
+        const gid = (_d = (_c = process.getgid) === null || _c === void 0 ? void 0 : _c.call(process)) !== null && _d !== void 0 ? _d : 1000;
+        yield exec.exec('sudo', ['chown', '-R', `${uid}:${gid}`, mirrorDir]);
+        if (fs.existsSync(mirrorPath)) {
+            yield fs.promises.rm(mirrorPath, { recursive: true, force: true });
+        }
+        yield exec.exec('git', ['init', '-q', '--bare', mirrorPath]);
+        yield exec.exec('git', [
+            '-C',
+            mirrorPath,
+            'remote',
+            'add',
+            '--mirror=fetch',
+            'origin',
+            repoUrl
+        ]);
+    });
 }
 /**
  * Ensure a bare git mirror exists. If the mirror doesn't exist, clone it.
@@ -3708,6 +3737,8 @@ function getSourceInner(settings, report, onHydrationReport) {
             // of this run (hydrated now, or synced via ls-remote diff). Only then can
             // the workspace copy its refs from the mirror instead of the network.
             let mirrorFresh = false;
+            // gitfs is hydrating an empty mirror: it has no refs to populate from.
+            let gitfsHydrates = false;
             if (blacksmithCache.shouldUseBlacksmithCache()) {
                 const setupStart = Date.now();
                 try {
@@ -3733,7 +3764,22 @@ function getSourceInner(settings, report, onHydrationReport) {
                         const cloneStart = Date.now();
                         let performedHydration = false;
                         try {
-                            performedHydration = yield blacksmithCache.ensureMirror(cacheInfo.mirrorPath, repositoryUrl, settings.authToken, settings.verbose);
+                            if (!mirrorExisted &&
+                                gitfs.isGitfsRequested() &&
+                                !gitfs.gitfsIneligibilityReason(settings, {
+                                    mirrorPath: cacheInfo.mirrorPath
+                                }) &&
+                                (yield gitfs.findBinary())) {
+                                // No blocking clone: gitfs streams the job's revision into the
+                                // empty mirror and completes it in the background.
+                                core.info(`[gitfs] no mirror at ${cacheInfo.mirrorPath}: gitfs hydrates it`);
+                                yield blacksmithCache.initEmptyMirror(cacheInfo.mirrorPath, repositoryUrl);
+                                performedHydration = true;
+                                gitfsHydrates = true;
+                            }
+                            else {
+                                performedHydration = yield blacksmithCache.ensureMirror(cacheInfo.mirrorPath, repositoryUrl, settings.authToken, settings.verbose);
+                            }
                         }
                         catch (error) {
                             if (!mirrorExisted) {
@@ -3768,7 +3814,7 @@ function getSourceInner(settings, report, onHydrationReport) {
                         }
                         if (performedHydration) {
                             // A freshly-cloned mirror is exactly the remote's current state
-                            mirrorFresh = true;
+                            mirrorFresh = !gitfsHydrates;
                         }
                         else if (settings.fetchDepth <= 0) {
                             // Bring the mirror's branch/tag refs up to date with the remote
@@ -3952,27 +3998,27 @@ function mountWithGitfs(settings, cacheInfo, repositoryUrl) {
             return null;
         }
         const candidates = gitfs.mirrorRevisionCandidates(settings.ref, settings.commit);
-        let revision = yield gitfs.resolveInMirror(cacheInfo.mirrorPath, candidates);
-        if (!revision) {
-            // The mirror does not have the requested revision yet (a push it has
-            // not synced, a pull-request merge ref): fetch just that into the
-            // mirror, where the regular path would have fetched it into the
-            // workspace. The mirror changed, so the post step commits it.
-            const refspecs = gitfs.mirrorFetchRefspecs(settings.ref, settings.commit);
-            core.info(`[gitfs] ${settings.commit || settings.ref} is not in the mirror, fetching ${refspecs.join(' ')}`);
-            yield gitfs.fetchIntoMirror(cacheInfo.mirrorPath, repositoryUrl, settings.authToken, refspecs);
-            stateHelper.setBlacksmithCacheMirrorChanged(true);
-            revision = yield gitfs.resolveInMirror(cacheInfo.mirrorPath, candidates);
-        }
-        if (!revision) {
-            core.info(`[gitfs] not used: ${settings.commit || settings.ref} could not be resolved in the mirror`);
-            return null;
-        }
+        const revision = yield gitfs.resolveInMirror(cacheInfo.mirrorPath, candidates);
         const mountStart = Date.now();
-        yield gitfs.mount(binary, cacheInfo.mirrorPath, revision.sha, settings.repositoryPath);
+        if (revision) {
+            yield gitfs.mount(binary, cacheInfo.mirrorPath, revision.sha, settings.repositoryPath);
+            stateHelper.setGitfsMountPoint(settings.repositoryPath);
+            core.info(`[gitfs] ${settings.repositoryPath} serves ${revision.sha} from the mirror (mounted in ${Date.now() - mountStart} ms); the tree is written out in the background`);
+            return revision;
+        }
+        // The mirror lacks the revision (an empty mirror, a push it has not
+        // synced, a pull-request merge ref): gitfs fetches it from the remote into
+        // the mirror and serves the pack as it arrives; the rest of the repository
+        // follows in the background. The mirror changes, so the post step commits
+        // it.
+        const rev = gitfs.coldRevision(settings.ref, settings.commit);
+        core.info(`[gitfs] ${rev} is not in the mirror, streaming it from the remote`);
+        const sha = yield gitfs.mountCold(binary, cacheInfo.mirrorPath, rev, settings.repositoryPath, repositoryUrl, settings.authToken);
         stateHelper.setGitfsMountPoint(settings.repositoryPath);
-        core.info(`[gitfs] ${settings.repositoryPath} serves ${revision.sha} from the mirror (mounted in ${Date.now() - mountStart} ms); the tree is written out in the background`);
-        return revision;
+        stateHelper.setBlacksmithCacheMirrorChanged(true);
+        const { mirrorRef, kind } = candidates[0];
+        core.info(`[gitfs] ${settings.repositoryPath} serves ${sha} streamed from the remote (mounted in ${Date.now() - mountStart} ms); the mirror is completed in the background`);
+        return { sha, mirrorRef, kind };
     });
 }
 /**
@@ -4313,10 +4359,11 @@ exports.isGitfsRequested = isGitfsRequested;
 exports.gitfsIneligibilityReason = gitfsIneligibilityReason;
 exports.findBinary = findBinary;
 exports.mirrorRevisionCandidates = mirrorRevisionCandidates;
-exports.mirrorFetchRefspecs = mirrorFetchRefspecs;
+exports.coldRevision = coldRevision;
 exports.resolveInMirror = resolveInMirror;
 exports.fetchIntoMirror = fetchIntoMirror;
 exports.mount = mount;
+exports.mountCold = mountCold;
 exports.pointWorkspaceAt = pointWorkspaceAt;
 exports.teardown = teardown;
 const core = __importStar(__nccwpck_require__(2186));
@@ -4433,23 +4480,17 @@ function mirrorRevisionCandidates(ref, commit) {
     ];
 }
 /**
- * Refspecs that bring the requested ref/commit into the mirror when it is
- * not there yet (a push the mirror has not synced, or a pull-request merge
- * ref). Qualified refs are fetched under their own name so the workspace
- * can mirror them; a bare commit is fetched by sha.
+ * What `gitfs mount --url` fetches for a revision the mirror lacks: a commit
+ * by sha, a qualified ref by name, an unqualified ref as a branch.
  */
-function mirrorFetchRefspecs(ref, commit) {
-    const qualified = !!ref && ref.toUpperCase().startsWith('REFS/');
+function coldRevision(ref, commit) {
     if (commit) {
-        return qualified ? [`+${commit}:${ref}`] : [commit];
+        return commit;
     }
-    if (qualified) {
-        return [`+${ref}:${ref}`];
+    if (ref.toUpperCase().startsWith('REFS/')) {
+        return ref;
     }
-    return [
-        `+refs/heads/${ref}*:refs/heads/${ref}*`,
-        `+refs/tags/${ref}*:refs/tags/${ref}*`
-    ];
+    return `refs/heads/${ref}`;
 }
 function resolveInMirror(mirrorPath, candidates) {
     return __awaiter(this, void 0, void 0, function* () {
@@ -4495,6 +4536,42 @@ function mount(binary, mirrorPath, sha, mountpoint) {
             mountpoint,
             '--daemon'
         ]);
+    });
+}
+/**
+ * Mount a revision the mirror does not have: gitfs fetches it from the
+ * remote into the mirror (`--depth 1`, serving the pack as it arrives) and
+ * completes the mirror in the background. Returns the commit sha, which
+ * gitfs prints once the commit is in, before git has written the ref.
+ */
+function mountCold(binary, mirrorPath, rev, mountpoint, repositoryUrl, authToken) {
+    return __awaiter(this, void 0, void 0, function* () {
+        var _a, _b;
+        if (fs.existsSync(mountpoint) && fs.readdirSync(mountpoint).length > 0) {
+            throw new Error(`${mountpoint} is not empty`);
+        }
+        const env = {};
+        for (const [key, value] of Object.entries(process.env)) {
+            if (value !== undefined) {
+                env[key] = value;
+            }
+        }
+        env.GITFS_TOKEN = authToken;
+        const result = yield exec.getExecOutput(binary, [
+            'mount',
+            mirrorPath,
+            '--ref',
+            rev,
+            mountpoint,
+            '--daemon',
+            '--url',
+            repositoryUrl
+        ], { env });
+        const sha = (_b = (_a = result.stdout.trim().split('\n').pop()) === null || _a === void 0 ? void 0 : _a.trim()) !== null && _b !== void 0 ? _b : '';
+        if (!/^[0-9a-f]{40}$/.test(sha)) {
+            throw new Error(`gitfs did not report the mounted commit: ${result.stdout.trim()}`);
+        }
+        return sha;
     });
 }
 /**

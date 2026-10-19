@@ -549,6 +549,35 @@ function summarizeTrace2Perf(trace2PerfPath: string, title: string): void {
 }
 
 /**
+ * An empty bare mirror with `git clone --mirror`'s config, for gitfs to
+ * stream the first job's revision into; gitfs completes the mirror in the
+ * background, so it is a full mirror by the time the job ends.
+ */
+export async function initEmptyMirror(
+  mirrorPath: string,
+  repoUrl: string
+): Promise<void> {
+  const mirrorDir = path.dirname(mirrorPath)
+  await exec.exec('sudo', ['mkdir', '-p', mirrorDir])
+  const uid = process.getuid?.() ?? 1000
+  const gid = process.getgid?.() ?? 1000
+  await exec.exec('sudo', ['chown', '-R', `${uid}:${gid}`, mirrorDir])
+  if (fs.existsSync(mirrorPath)) {
+    await fs.promises.rm(mirrorPath, {recursive: true, force: true})
+  }
+  await exec.exec('git', ['init', '-q', '--bare', mirrorPath])
+  await exec.exec('git', [
+    '-C',
+    mirrorPath,
+    'remote',
+    'add',
+    '--mirror=fetch',
+    'origin',
+    repoUrl
+  ])
+}
+
+/**
  * Ensure a bare git mirror exists. If the mirror doesn't exist, clone it.
  * If the mirror already exists, it is left as-is; the caller brings it up to
  * date with syncMirrorFromRemote(), which only pays for refs that actually

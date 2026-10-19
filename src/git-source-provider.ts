@@ -161,6 +161,8 @@ async function getSourceInner(
     // of this run (hydrated now, or synced via ls-remote diff). Only then can
     // the workspace copy its refs from the mirror instead of the network.
     let mirrorFresh = false
+    // gitfs is hydrating an empty mirror: it has no refs to populate from.
+    let gitfsHydrates = false
     if (blacksmithCache.shouldUseBlacksmithCache()) {
       const setupStart = Date.now()
       try {
@@ -194,12 +196,33 @@ async function getSourceInner(
           const cloneStart = Date.now()
           let performedHydration = false
           try {
-            performedHydration = await blacksmithCache.ensureMirror(
-              cacheInfo.mirrorPath,
-              repositoryUrl,
-              settings.authToken,
-              settings.verbose
-            )
+            if (
+              !mirrorExisted &&
+              gitfs.isGitfsRequested() &&
+              !gitfs.gitfsIneligibilityReason(settings, {
+                mirrorPath: cacheInfo.mirrorPath
+              }) &&
+              (await gitfs.findBinary())
+            ) {
+              // No blocking clone: gitfs streams the job's revision into the
+              // empty mirror and completes it in the background.
+              core.info(
+                `[gitfs] no mirror at ${cacheInfo.mirrorPath}: gitfs hydrates it`
+              )
+              await blacksmithCache.initEmptyMirror(
+                cacheInfo.mirrorPath,
+                repositoryUrl
+              )
+              performedHydration = true
+              gitfsHydrates = true
+            } else {
+              performedHydration = await blacksmithCache.ensureMirror(
+                cacheInfo.mirrorPath,
+                repositoryUrl,
+                settings.authToken,
+                settings.verbose
+              )
+            }
           } catch (error) {
             if (!mirrorExisted) {
               onHydrationReport({
@@ -235,7 +258,7 @@ async function getSourceInner(
 
           if (performedHydration) {
             // A freshly-cloned mirror is exactly the remote's current state
-            mirrorFresh = true
+            mirrorFresh = !gitfsHydrates
           } else if (settings.fetchDepth <= 0) {
             // Bring the mirror's branch/tag refs up to date with the remote
             // (ls-remote diff + targeted fetch of only the changed refs), so
@@ -486,44 +509,43 @@ async function mountWithGitfs(
     settings.ref,
     settings.commit
   )
-  let revision = await gitfs.resolveInMirror(cacheInfo.mirrorPath, candidates)
-  if (!revision) {
-    // The mirror does not have the requested revision yet (a push it has
-    // not synced, a pull-request merge ref): fetch just that into the
-    // mirror, where the regular path would have fetched it into the
-    // workspace. The mirror changed, so the post step commits it.
-    const refspecs = gitfs.mirrorFetchRefspecs(settings.ref, settings.commit)
-    core.info(
-      `[gitfs] ${settings.commit || settings.ref} is not in the mirror, fetching ${refspecs.join(' ')}`
-    )
-    await gitfs.fetchIntoMirror(
-      cacheInfo.mirrorPath,
-      repositoryUrl,
-      settings.authToken,
-      refspecs
-    )
-    stateHelper.setBlacksmithCacheMirrorChanged(true)
-    revision = await gitfs.resolveInMirror(cacheInfo.mirrorPath, candidates)
-  }
-  if (!revision) {
-    core.info(
-      `[gitfs] not used: ${settings.commit || settings.ref} could not be resolved in the mirror`
-    )
-    return null
-  }
-
+  const revision = await gitfs.resolveInMirror(cacheInfo.mirrorPath, candidates)
   const mountStart = Date.now()
-  await gitfs.mount(
+  if (revision) {
+    await gitfs.mount(
+      binary,
+      cacheInfo.mirrorPath,
+      revision.sha,
+      settings.repositoryPath
+    )
+    stateHelper.setGitfsMountPoint(settings.repositoryPath)
+    core.info(
+      `[gitfs] ${settings.repositoryPath} serves ${revision.sha} from the mirror (mounted in ${Date.now() - mountStart} ms); the tree is written out in the background`
+    )
+    return revision
+  }
+  // The mirror lacks the revision (an empty mirror, a push it has not
+  // synced, a pull-request merge ref): gitfs fetches it from the remote into
+  // the mirror and serves the pack as it arrives; the rest of the repository
+  // follows in the background. The mirror changes, so the post step commits
+  // it.
+  const rev = gitfs.coldRevision(settings.ref, settings.commit)
+  core.info(`[gitfs] ${rev} is not in the mirror, streaming it from the remote`)
+  const sha = await gitfs.mountCold(
     binary,
     cacheInfo.mirrorPath,
-    revision.sha,
-    settings.repositoryPath
+    rev,
+    settings.repositoryPath,
+    repositoryUrl,
+    settings.authToken
   )
   stateHelper.setGitfsMountPoint(settings.repositoryPath)
+  stateHelper.setBlacksmithCacheMirrorChanged(true)
+  const {mirrorRef, kind} = candidates[0]
   core.info(
-    `[gitfs] ${settings.repositoryPath} serves ${revision.sha} from the mirror (mounted in ${Date.now() - mountStart} ms); the tree is written out in the background`
+    `[gitfs] ${settings.repositoryPath} serves ${sha} streamed from the remote (mounted in ${Date.now() - mountStart} ms); the mirror is completed in the background`
   )
-  return revision
+  return {sha, mirrorRef, kind}
 }
 
 /**
